@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "telegram-media-library"
+version = "0.1.0"
+description = "Private Telegram media album scheduler and distributor"
+requires-python = ">=3.11"
+dependencies = [
+    "Telethon>=1.36,<2",
+    "tzdata>=2025.2",
+]
+
+[project.scripts]
+telegram-media-library = "app.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
