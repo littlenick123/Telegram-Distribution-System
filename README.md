@@ -68,6 +68,214 @@ Docker 是新增的可选运行方式，不会替代纯 Python。两种方式使
 
 镜像基于 Python 3.12 slim，使用非 root 用户运行，并安装上海时区、CA 证书和 OpenSSL 运行库。Compose 会把宿主机的 `./data` 挂载为容器内的 `/app/data`，数据库和 Telegram 登录状态不会写入镜像。
 
+### Linux（Debian 12/13）安装 Docker 环境
+
+下面同时适用于 Debian GNU/Linux 12（Bookworm）和 Debian GNU/Linux 13（Trixie）正式发行版，以 VPS 的 `root` 终端为例。Docker 官方目前支持这两个版本；Debian 13 是当前 stable，适合全新部署，Debian 12 是仍受支持的 oldstable/LTS，已有服务器可以继续使用。这里的命令会读取 `/etc/os-release`，自动选择 `bookworm` 或 `trixie` 仓库，不需要手工维护两套命令。
+
+| Debian 版本 | 代号 | 当前定位 | 本教程建议 |
+|---|---|---|---|
+| Debian 13 | `trixie` | stable | 新 VPS 优先选择 |
+| Debian 12 | `bookworm` | oldstable/LTS | 已有 VPS 可继续使用 |
+
+安装前可查看当前版本：
+
+```bash
+cat /etc/os-release
+. /etc/os-release
+echo "Debian $VERSION_ID ($VERSION_CODENAME)"
+```
+
+输出中的 `VERSION_CODENAME` 应为 `bookworm` 或 `trixie`。其他 Debian 版本应先查看 [Docker 官方 Debian 安装文档](https://docs.docker.com/engine/install/debian/) 是否仍受支持；Ubuntu 应改用 Docker 官方 Ubuntu 教程，不要直接套用本节 Debian 软件源。
+
+不要只安装 Debian 发行版仓库中的旧版 `docker.io`、`docker-buildx` 或 `docker-compose`。发行版组件可能出现 Compose 已升级、Buildx 仍过旧的混装状态，例如：
+
+```text
+compose build requires buildx 0.17.0 or later
+```
+
+先确认系统和当前软件来源：
+
+```bash
+cat /etc/os-release
+docker --version 2>/dev/null || true
+docker buildx version 2>/dev/null || true
+docker compose version 2>/dev/null || true
+apt-cache policy docker-ce docker.io docker-buildx docker-buildx-plugin docker-compose-plugin
+```
+
+如果已安装 Debian 自带版本，先停止 Docker 并移除冲突包。卸载软件包不会自动删除 `/var/lib/docker` 中已有的镜像、容器、网络和卷，但仍建议提前备份重要数据；不要手工删除 `/var/lib/docker` 或 `/var/lib/containerd`：
+
+```bash
+systemctl stop docker docker.socket containerd 2>/dev/null || true
+
+for pkg in docker.io docker-compose docker-compose-v2 docker-buildx docker-doc podman-docker containerd runc; do
+  if dpkg-query -W -f='${db:Status-Abbrev}' "$pkg" 2>/dev/null | grep -q '^ii'; then
+    apt-get remove -y "$pkg"
+  fi
+done
+```
+
+安装基础工具并配置 Docker 官方 APT 仓库：
+
+```bash
+apt-get update
+apt-get install -y ca-certificates curl
+install -m 0755 -d /etc/apt/keyrings
+
+curl -fsSL https://download.docker.com/linux/debian/gpg \
+  -o /etc/apt/keyrings/docker.asc
+chmod a+r /etc/apt/keyrings/docker.asc
+
+cat > /etc/apt/sources.list.d/docker.sources <<EOF
+Types: deb
+URIs: https://download.docker.com/linux/debian
+Suites: $(. /etc/os-release && echo "$VERSION_CODENAME")
+Components: stable
+Architectures: $(dpkg --print-architecture)
+Signed-By: /etc/apt/keyrings/docker.asc
+EOF
+
+apt-get update
+apt-cache policy docker-ce docker-buildx-plugin docker-compose-plugin
+```
+
+最后一条命令显示的 Candidate 应来自 `download.docker.com`。然后安装 Docker Engine、Buildx 和 Compose v2：
+
+```bash
+apt-get install -y \
+  docker-ce \
+  docker-ce-cli \
+  containerd.io \
+  docker-buildx-plugin \
+  docker-compose-plugin
+
+systemctl enable --now docker
+hash -r
+```
+
+验证环境：
+
+```bash
+docker --version
+docker buildx version
+docker compose version
+systemctl is-active docker
+```
+
+四条命令都应成功，`systemctl is-active docker` 应输出 `active`。本项目当前 Compose 构建至少需要 Buildx `0.17.0`；版本字符串中如果仍出现 Debian 的 `+ds1` 且版本过低，检查 `/root/.docker/cli-plugins/docker-buildx` 是否有旧的手工插件覆盖系统插件。
+
+可以再运行 Docker 官方测试容器，确认镜像下载和容器运行正常：
+
+```bash
+docker run --rm hello-world
+```
+
+root 用户可以直接使用 Docker。普通 Linux 用户如需省略 `sudo`，可选择加入 `docker` 组，然后注销并重新登录：
+
+```bash
+sudo usermod -aG docker "$USER"
+```
+
+`docker` 组等同于授予较高的主机权限，只应加入可信用户。
+
+### `compose.yaml` 配置详解
+
+项目根目录的 [`compose.yaml`](compose.yaml) 是 Docker Compose 的唯一服务定义。在该目录执行 `docker compose ...` 时，Compose 会自动读取此文件，无需额外使用 `-f` 参数。
+
+```yaml
+name: telegram-distribution-system
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_UID: ${APP_UID:-1000}
+        APP_GID: ${APP_GID:-1000}
+    image: telegram-distribution-system:local
+    container_name: telegram-distribution-system
+    env_file:
+      - .env
+    environment:
+      DATA_DIR: /app/data
+      TZ: Asia/Shanghai
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - type: bind
+        source: ./data
+        target: /app/data
+    restart: unless-stopped
+    init: true
+    stop_signal: SIGINT
+    stop_grace_period: 30s
+```
+
+各字段作用如下：
+
+| 字段 | 作用 |
+|---|---|
+| `name` | Compose 项目名称，用于生成默认网络等资源名称。 |
+| `services.app` | 定义唯一的常驻服务；后续命令中的 `app`，例如 `docker compose logs app`，指的就是这里。 |
+| `build.context: .` | 使用项目根目录作为镜像构建上下文。`.dockerignore` 会阻止 `.env`、`data` 和 session 进入上下文。 |
+| `build.dockerfile` | 指定使用项目根目录的 `Dockerfile`。 |
+| `build.args` | 把 `.env` 中的 `APP_UID/APP_GID` 传入镜像构建；未配置时默认 `1000`，用于创建非 root 容器用户。 |
+| `image` | 构建后的本地镜像名称和标签，即 `telegram-distribution-system:local`。 |
+| `container_name` | 固定运行容器名称为 `telegram-distribution-system`，方便使用 `docker stats` 和 `docker inspect`。 |
+| `env_file` | 把 `.env` 中的 Telegram 凭据、管理员 ID 和日志级别传入容器。`.env` 不会被复制到镜像。 |
+| `environment` | 设置容器专用环境变量；这里的值优先于 `env_file` 中的同名值。 |
+| `DATA_DIR` | 强制容器把数据库和 session 写到 `/app/data`，因此宿主机 `.env` 中可继续保留 `DATA_DIR=data` 供纯 Python 使用。 |
+| `TZ` | 设置容器系统时区为 `Asia/Shanghai`，日志时间与调度时区一致。 |
+| `PYTHONUNBUFFERED` | 关闭 Python 日志缓冲，使 `docker compose logs` 能及时显示输出。 |
+| `volumes` | 使用绑定挂载，把宿主机 `./data` 映射到容器 `/app/data`；容器删除或重建后数据仍在宿主机。 |
+| `restart` | `unless-stopped` 表示异常退出或服务器重启后自动恢复，但手工停止后保持停止。 |
+| `init` | 在容器中加入轻量 init 进程，负责转发停止信号并回收子进程。 |
+| `stop_signal` | 停止容器时发送 `SIGINT`，效果接近纯 Python 终端按 `Ctrl+C`。 |
+| `stop_grace_period` | 最多等待 30 秒完成 Telegram 断开和 SQLite 关闭，超时后 Docker 才强制结束。 |
+
+Compose 没有配置 `ports`，因为程序只主动连接 Telegram，不提供 Web 服务或监听端口。当前也没有设置 CPU 或内存硬限制，容器可使用 VPS 的可用资源；可以用下面的命令观察实际占用：
+
+```text
+docker stats telegram-distribution-system
+```
+
+#### `.env` 在 Compose 中的两种用途
+
+同一个 `.env` 同时承担两种作用：
+
+1. `${APP_UID:-1000}` 和 `${APP_GID:-1000}` 在解析 `compose.yaml` 时用于变量替换。
+2. `env_file: .env` 把 Telegram 配置传入运行中的容器。
+
+`environment` 中显式设置的 `DATA_DIR=/app/data`、`TZ` 和 `PYTHONUNBUFFERED` 会覆盖 `.env` 中的同名值。这样同一份 `.env` 可以同时用于纯 Python 和 Docker，而不需要手工把 `DATA_DIR` 改来改去。
+
+验证 Compose 文件语法时使用：
+
+```text
+docker compose config --quiet
+```
+
+成功时该命令没有输出。不要把不带 `--quiet` 的 `docker compose config` 完整结果发送给别人，因为展开后的配置可能显示 `.env` 中的机器人 Token、API Hash 和手机号。
+
+#### 修改 Compose 配置后如何生效
+
+| 修改内容 | 生效命令 |
+|---|---|
+| 只修改 Python 代码、`Dockerfile` 或依赖 | `docker compose up -d --build` |
+| 修改 `.env` 或普通 Compose 运行参数 | `docker compose up -d --force-recreate` |
+| 修改构建参数 `APP_UID/APP_GID` | `docker compose build --no-cache`，然后 `docker compose up -d --force-recreate` |
+| 修改 `data` 挂载路径 | 先 `docker compose down`，完整迁移数据目录，再重新启动 |
+
+如果希望把 VPS 数据放在项目目录之外，可将 `source` 改成绝对路径，例如：
+
+```yaml
+volumes:
+  - type: bind
+    source: /opt/telegram-distribution/data
+    target: /app/data
+```
+
+修改前必须停止服务并完整移动原 `data`，不能只移动 `library.sqlite3`。如果在同一台服务器运行多套实例，还必须分别修改顶层 `name`、`container_name`、`.env` 和数据路径；不同实例绝不能共用同一个 Telegram session 或 SQLite 数据目录。
+
 ### 全新 Docker 部署
 
 首先创建配置和持久化目录。
@@ -86,12 +294,21 @@ cp .env.example .env
 mkdir -p data
 ```
 
-编辑 `.env` 中的 Telegram 凭据。Linux 用户还应把下面两个值改为 `id -u` 和 `id -g` 的输出，使容器用户能写入绑定目录；Windows Docker Desktop 可保留默认的 `1000`：
+编辑 `.env` 中的 Telegram 凭据。Linux 使用普通部署用户时，可把下面两个值改为该用户 `id -u` 和 `id -g` 的非零输出，使容器用户能写入绑定目录；Windows Docker Desktop 可保留默认的 `1000`：
 
 ```dotenv
 APP_UID=1000
 APP_GID=1000
 ```
+
+如果像常见 VPS 一样直接使用 `root` 部署，`id -u` 和 `id -g` 都是 `0`，**不要**把构建参数设置成 `0:0`。保留 `APP_UID=1000`、`APP_GID=1000`，并为绑定目录设置对应所有者：
+
+```bash
+mkdir -p data
+chown -R 1000:1000 data
+```
+
+`mkdir -p` 在目录不存在时创建它，已经存在时不会清空内容；`chown -R` 只修改目录及文件所有权，不删除数据库或 session。
 
 构建镜像：
 
@@ -186,9 +403,13 @@ docker compose start app
 
 ### Docker 排障
 
-- `PermissionError` 或数据库只读：停止容器，确认 `.env` 的 `APP_UID/APP_GID` 与宿主机 `id -u`、`id -g` 一致，然后重新执行 `docker compose build --no-cache`；必要时修正 `data` 所有者。
+- `docker: 'compose' is not a docker command`：当前没有 Compose v2 插件。按“Linux（Debian 12/13）安装 Docker 环境”配置 Docker 官方仓库并安装 `docker-compose-plugin`，不要继续安装已过时的独立 `docker-compose` 命令。
+- `compose build requires buildx 0.17.0 or later`：执行 `docker buildx version`。如果版本带 `+ds1` 且过低，说明仍在使用 Debian 的 `docker-buildx`；移除冲突包并安装官方 `docker-buildx-plugin`。
+- 构建前出现本地镜像 `pull access denied`：首次部署时本地镜像尚不存在，Compose 可能先尝试拉取后转为构建；若随后显示 Buildx 错误，应先修复 Buildx，再单独运行 `docker compose build`。
+- `PermissionError` 或数据库只读：停止容器。普通部署用户应让 `.env` 的 `APP_UID/APP_GID` 与其非零的 `id -u`、`id -g` 一致；root 部署保留 `1000:1000` 并执行 `chown -R 1000:1000 data`。修改构建参数后重新执行 `docker compose build --no-cache`。
 - `database is locked`：检查纯 Python 服务是否仍在运行，确保同一份 `data` 只有一个实例使用。
 - `用户账号尚未登录`：执行 `docker compose run --rm app login`，不要在已经运行的服务容器中重新登录。
+- `AccessTokenExpiredError: Bot token expired`：管理机器人 Token 已失效。在 BotFather 获取新 Token，替换 `.env` 中的 `MANAGER_BOT_TOKEN`，然后执行 `docker compose up -d --force-recreate`。这不需要重新执行普通用户账号的 `app login`。
 - 容器反复重启：执行 `docker compose logs --tail=300 app` 查看最早的配置或登录错误。
 - 修改 `.env` 后未生效：执行 `docker compose up -d --force-recreate`，单纯 `restart` 不会重新读取 Compose 环境配置。
 - Linux 目录权限仍不正确：执行 `ls -ln data` 核对数字所有者；容器用户可用 `docker compose run --rm --entrypoint id app` 查看。
