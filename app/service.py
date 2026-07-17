@@ -42,7 +42,14 @@ async def run_service(config: Config) -> None:
         # Reconcile source history before schedules are allowed to consume missed slots.
         await collector.backfill_all()
 
-        manager = ManagerBot(bot, user, db, config.admin_user_ids)
+        manager = ManagerBot(
+            bot,
+            user,
+            db,
+            config.admin_user_ids,
+            history_wakeup=collector.request_history_scan,
+        )
+        collector.notify_scan_result = manager.send_scan_notice
         manager.register_handlers()
         await bot.start(bot_token=config.bot_token)
         await manager.sync_command_menu()
@@ -52,6 +59,7 @@ async def run_service(config: Config) -> None:
         tasks = [
             asyncio.create_task(scheduler.run(), name="scheduler"),
             asyncio.create_task(collector.periodic_backfill(), name="backfill"),
+            asyncio.create_task(collector.history_worker(), name="history-backfill"),
         ]
         logger.info("服务已启动")
         await asyncio.gather(*tasks)

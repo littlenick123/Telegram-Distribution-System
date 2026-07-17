@@ -11,11 +11,22 @@ from app.telegram_service import AlbumCollector, AlbumPublisher
 
 
 class FakeTelegramClient:
-    def __init__(self, messages: list[object]):
+    def __init__(self, messages: list[object], topics: list[object] | None = None):
         self.messages = messages
+        self.topics = topics if topics is not None else [
+            SimpleNamespace(id=135, title="动作电影", closed=False, hidden=False)
+        ]
         self.send_calls: list[tuple[int, dict[str, object]]] = []
 
-    async def get_messages(self, entity: int, ids: list[int]):
+    async def get_messages(
+        self, entity: int, ids: int | list[int] | None = None, **kwargs: object
+    ):
+        if ids is None:
+            items = sorted(self.messages, key=lambda item: item.id, reverse=True)
+            limit = kwargs.get("limit")
+            return items[: int(limit)] if limit else items
+        if isinstance(ids, int):
+            return next((message for message in self.messages if message.id == ids), None)
         wanted = set(ids)
         return [message for message in self.messages if message.id in wanted]
 
@@ -23,10 +34,18 @@ class FakeTelegramClient:
         self.send_calls.append((entity, kwargs))
         return [SimpleNamespace(id=900 + index) for index, _ in enumerate(kwargs["file"])]
 
+    async def __call__(self, request: object) -> object:
+        return SimpleNamespace(topics=self.topics)
+
     def iter_messages(self, entity: int, **kwargs: object):
         async def iterator():
-            for message in self.messages:
-                if message.id > kwargs.get("min_id", 0):
+            reverse = bool(kwargs.get("reverse", False))
+            items = sorted(self.messages, key=lambda item: item.id, reverse=not reverse)
+            for message in items:
+                if (
+                    message.id > kwargs.get("min_id", 0)
+                    and (not kwargs.get("max_id") or message.id < kwargs["max_id"])
+                ):
                     yield message
         return iterator()
 
@@ -65,6 +84,45 @@ class TelegramServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.db.inventory(-2001)[0]["pending_count"], 1)
         self.assertEqual(self.db.get_source(-1001)["last_message_id"], 13)
 
+    async def test_history_scan_is_newest_first_and_completes_album_boundary(self) -> None:
+        self.db.add_source(
+            -1002, "历史源", 20, history_start_id=11, requested_by=123
+        )
+        self.db.add_route(
+            -1002, -2002, "历史目标", delivery_start_message_id=21
+        )
+        self.db.backfill_route(
+            -2002, start_message_id=11, target_message_id=20
+        )
+        client = FakeTelegramClient([
+            message(10, 500, "边界前成员"),
+            message(11, 500, "边界消息"),
+            message(18, 501, "较新一"),
+            message(19, 501, "较新二"),
+        ])
+        collector = AlbumCollector(client, self.db)
+        notices: list[tuple[int, str]] = []
+
+        async def notify(admin_id: int, text: str) -> None:
+            notices.append((admin_id, text))
+
+        collector.notify_scan_result = notify
+        await collector.backfill_history_source(self.db.get_source(-1002))
+
+        source = self.db.get_source(-1002)
+        self.assertEqual(source["history_covered_from_id"], 10)
+        self.assertEqual(source["history_scan_status"], "idle")
+        route = self.db.get_route_by_target(-2002)
+        self.assertEqual(route["backfill_status"], "idle")
+        self.assertEqual(self.db.delivery_counts(-2002), {"pending": 2})
+        self.assertEqual(notices[0][0], 123)
+        self.assertIn("历史扫描完成", notices[0][1])
+
+    async def test_realtime_album_does_not_jump_forward_scan_cursor(self) -> None:
+        messages = [message(50, 700), message(51, 700)]
+        self.db.ingest_album(-1001, 700, [50, 51], messages[0].date)
+        self.assertEqual(self.db.get_source(-1001)["last_message_id"], 10)
+
     async def test_publisher_copies_album_without_forwarding(self) -> None:
         messages = [message(11, 500, "第一项"), message(12, 500, "第二项")]
         client = FakeTelegramClient(messages)
@@ -80,7 +138,43 @@ class TelegramServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["file"], ["media-11", "media-12"])
         self.assertEqual(kwargs["caption"], ["第一项", "第二项"])
         self.assertEqual(kwargs["formatting_entities"], [["entity-11"], ["entity-12"]])
+        self.assertNotIn("reply_to", kwargs)
         self.assertEqual(self.db.delivery_counts(-2001), {"sent": 1})
+
+    async def test_publisher_sends_album_to_configured_forum_topic(self) -> None:
+        self.db.add_route(-1001, -2001, "话题群", 135, "动作电影")
+        messages = [message(11, 500, "第一项"), message(12, 500, "第二项")]
+        client = FakeTelegramClient(messages)
+        self.db.ingest_album(-1001, 500, [11, 12], messages[0].date)
+        route = self.db.get_route_by_target(-2001, 135)
+        publisher = AlbumPublisher(client, self.db, min_target_interval=0)
+        await publisher.publish_for_slot(
+            {"route_id": route["id"], "target_telegram_id": -2001, "target_topic_id": 135},
+            datetime(2026, 7, 16, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(len(client.send_calls), 1)
+        target, kwargs = client.send_calls[0]
+        self.assertEqual(target, -2001)
+        self.assertEqual(kwargs["reply_to"], 135)
+        self.assertEqual(self.db.delivery_counts(-2001, 135), {"sent": 1})
+
+    async def test_missing_topic_fails_without_falling_back_to_group(self) -> None:
+        self.db.add_route(-1001, -2001, "话题群", 135, "动作电影")
+        messages = [message(11, 500), message(12, 500)]
+        client = FakeTelegramClient(messages, topics=[])
+        self.db.ingest_album(-1001, 500, [11, 12], messages[0].date)
+        route = self.db.get_route_by_target(-2001, 135)
+        publisher = AlbumPublisher(client, self.db, min_target_interval=0)
+        await publisher.publish_for_slot(
+            {"route_id": route["id"], "target_telegram_id": -2001, "target_topic_id": 135},
+            datetime(2026, 7, 16, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(client.send_calls, [])
+        self.assertEqual(self.db.delivery_counts(-2001, 135), {"failed": 1})
+        issue = self.db.list_issues(-2001, target_topic_id=135)[0]
+        self.assertIn("已删除或不存在", issue["last_error"])
 
     async def test_incomplete_source_album_cancels_all_copies(self) -> None:
         complete = [message(11, 500), message(12, 500)]

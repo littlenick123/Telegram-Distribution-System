@@ -77,6 +77,8 @@ class ScheduleRunner:
             if row["alert_enabled"]
             and row["route_enabled"]
             and row["source_enabled"]
+            and row["backfill_status"] == "idle"
+            and row["forward_scan_status"] == "idle"
             and row["pending_count"] < row["threshold"]
         ]
         if low:
