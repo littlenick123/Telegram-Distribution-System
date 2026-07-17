@@ -1,0 +1,26 @@
+name: telegram-distribution-system
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_UID: ${APP_UID:-1000}
+        APP_GID: ${APP_GID:-1000}
+    image: telegram-distribution-system:local
+    container_name: telegram-distribution-system
+    env_file:
+      - .env
+    environment:
+      DATA_DIR: /app/data
+      TZ: Asia/Shanghai
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - type: bind
+        source: ./data
+        target: /app/data
+    restart: unless-stopped
+    init: true
+    stop_signal: SIGINT
+    stop_grace_period: 30s

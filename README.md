@@ -12,7 +12,7 @@
 
 > Telegram 会话文件等同于登录凭据。请保护 `DATA_DIR`，不要上传 `.env`、数据库或 `.session` 文件。
 
-## 安装
+## 纯 Python 安装
 
 ```powershell
 py -3.11 -m venv .venv
@@ -37,7 +37,7 @@ LOG_LEVEL=INFO
 
 `ADMIN_USER_IDS` 是 Telegram 数字用户 ID，多个 ID 用英文逗号分隔。
 
-## 首次启动
+## 纯 Python 首次启动
 
 先登录普通用户账号：
 
@@ -54,6 +54,147 @@ python -m app run
 服务会在 `DATA_DIR` 中创建 SQLite 数据库和两个 Telethon 会话。源频道可选择只监控新帖、扫描全部历史，或从指定消息 ID 开始建立影视库；重启后会从持久化游标继续。
 
 从旧版本升级时，服务启动会自动把数据库迁移到 schema v3。现有普通频道/话题路由、投递、发布时间和告警设置会保留；已有路由默认继续从原水位之后接收，不会突然获得旧库存。
+
+## Docker Compose 部署
+
+Docker 是新增的可选运行方式，不会替代纯 Python。两种方式使用相同代码、`.env` 和 `data` 数据，但**绝对不能同时运行**，否则可能导致 Telegram session 冲突、SQLite 锁定或重复发布。
+
+### 前置要求
+
+- Windows：安装并启动 Docker Desktop，确认使用 Linux containers。
+- Linux：安装 Docker Engine 和 Compose v2 插件。
+- 在项目目录执行 `docker version` 和 `docker compose version` 均能正常显示版本。
+- 部署机器必须能够主动访问 Telegram；本项目不监听端口，不需要配置端口映射。
+
+镜像基于 Python 3.12 slim，使用非 root 用户运行，并安装上海时区、CA 证书和 OpenSSL 运行库。Compose 会把宿主机的 `./data` 挂载为容器内的 `/app/data`，数据库和 Telegram 登录状态不会写入镜像。
+
+### 全新 Docker 部署
+
+首先创建配置和持久化目录。
+
+Windows PowerShell：
+
+```powershell
+Copy-Item .env.example .env
+New-Item -ItemType Directory -Force data
+```
+
+Linux：
+
+```bash
+cp .env.example .env
+mkdir -p data
+```
+
+编辑 `.env` 中的 Telegram 凭据。Linux 用户还应把下面两个值改为 `id -u` 和 `id -g` 的输出，使容器用户能写入绑定目录；Windows Docker Desktop 可保留默认的 `1000`：
+
+```dotenv
+APP_UID=1000
+APP_GID=1000
+```
+
+构建镜像：
+
+```text
+docker compose build
+```
+
+首次使用必须交互登录普通 Telegram 用户账号：
+
+```text
+docker compose run --rm app login
+```
+
+按提示输入短信或 Telegram 验证码；账号启用两步验证时继续输入密码。登录成功后，`data/user.session` 会保存在宿主机。随后后台启动常驻服务：
+
+```text
+docker compose up -d
+```
+
+检查状态与启动日志：
+
+```text
+docker compose ps
+docker compose logs --tail=200 app
+```
+
+看到“机器人私聊命令菜单已同步”和“服务已启动”即表示启动完成。管理员仍需先私聊机器人发送 `/start`，才能接收主动库存提醒。
+
+### 从现有纯 Python 环境迁移
+
+当前项目已经存在 `data/library.sqlite3`、`user.session` 和 `manager_bot.session` 时，不需要重新登录或重新配置频道：
+
+1. 在纯 Python 服务终端按 `Ctrl+C`，确认进程已经停止。
+2. 不要移动或删除现有 `data` 目录，也不要在迁移过程中单独复制正在使用的 SQLite 文件。
+3. 执行：
+
+   ```text
+   docker compose up -d --build
+   ```
+
+4. 使用 `docker compose logs -f app` 确认服务正常启动。
+
+以后如果要切回纯 Python，先执行 `docker compose down`，再运行 `python -m app run`。`down` 只删除容器和 Compose 网络，不会删除绑定的 `./data`。
+
+### 日常运维命令
+
+```text
+# 查看容器状态
+docker compose ps
+
+# 持续查看日志，Ctrl+C 只退出日志查看，不停止服务
+docker compose logs -f --tail=200 app
+
+# 重启服务
+docker compose restart app
+
+# 正常停止，再次启动仍保留容器
+docker compose stop app
+docker compose start app
+
+# 停止并删除容器；绑定的 data 不会删除
+docker compose down
+
+# 拉取代码更新后重新构建并启动
+git pull
+docker compose up -d --build
+```
+
+Compose 配置了 `restart: unless-stopped`，Docker 守护进程或服务器重启后会自动恢复服务；手工停止的容器不会自行重新启动。停止时会发送 `SIGINT` 并等待最多 30 秒，让程序断开 Telegram 并关闭 SQLite。
+
+### 备份与恢复
+
+`data` 中同时包含 SQLite 数据库和等同于登录凭据的 Telegram session。备份前必须先停止服务，避免把数据库文件、WAL 和 session 复制到不一致的时间点。
+
+Windows PowerShell：
+
+```powershell
+docker compose stop app
+Compress-Archive -Path data -DestinationPath telegram-data-backup.zip -Force
+docker compose start app
+```
+
+Linux：
+
+```bash
+docker compose stop app
+tar -czf telegram-data-backup.tar.gz data
+docker compose start app
+```
+
+恢复时先执行 `docker compose down`，备份当前 `data`，再用备份中的完整目录替换它并执行 `docker compose up -d`。不要只恢复 `library.sqlite3` 而遗漏 `-wal`、`-shm` 或 session 文件。
+
+### Docker 排障
+
+- `PermissionError` 或数据库只读：停止容器，确认 `.env` 的 `APP_UID/APP_GID` 与宿主机 `id -u`、`id -g` 一致，然后重新执行 `docker compose build --no-cache`；必要时修正 `data` 所有者。
+- `database is locked`：检查纯 Python 服务是否仍在运行，确保同一份 `data` 只有一个实例使用。
+- `用户账号尚未登录`：执行 `docker compose run --rm app login`，不要在已经运行的服务容器中重新登录。
+- 容器反复重启：执行 `docker compose logs --tail=300 app` 查看最早的配置或登录错误。
+- 修改 `.env` 后未生效：执行 `docker compose up -d --force-recreate`，单纯 `restart` 不会重新读取 Compose 环境配置。
+- Linux 目录权限仍不正确：执行 `ls -ln data` 核对数字所有者；容器用户可用 `docker compose run --rm --entrypoint id app` 查看。
+- 检查容器时区：执行 `docker compose run --rm --entrypoint date app`，应显示中国标准时间。调度逻辑本身始终使用 `Asia/Shanghai`。
+
+安全注意事项：不要把 `.env`、`data` 或备份压缩包提交到 Git，也不要把 session 文件发送给他人。Docker 镜像和构建上下文已通过 `.dockerignore` 排除这些内容。
 
 ## 推荐配置顺序
 
