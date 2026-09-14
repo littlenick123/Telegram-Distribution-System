@@ -7,6 +7,7 @@ from telethon import TelegramClient
 
 from .config import Config
 from .db import Database
+from .immediate import ImmediateSendRunner
 from .manager_bot import ManagerBot
 from .scheduler import ScheduleRunner
 from .telegram_service import AlbumCollector, AlbumPublisher
@@ -42,6 +43,7 @@ async def run_service(config: Config) -> None:
         # Reconcile source history before schedules are allowed to consume missed slots.
         await collector.backfill_all()
 
+        publisher = AlbumPublisher(user, db)
         manager = ManagerBot(
             bot,
             user,
@@ -50,16 +52,18 @@ async def run_service(config: Config) -> None:
             history_wakeup=collector.request_history_scan,
         )
         collector.notify_scan_result = manager.send_scan_notice
+        immediate = ImmediateSendRunner(db, publisher, manager.send_immediate_notice)
+        manager.immediate_wakeup = immediate.wake
         manager.register_handlers()
         await bot.start(bot_token=config.bot_token)
         await manager.sync_command_menu()
 
-        publisher = AlbumPublisher(user, db)
         scheduler = ScheduleRunner(db, publisher.publish_for_slot, manager.send_inventory_alerts)
         tasks = [
             asyncio.create_task(scheduler.run(), name="scheduler"),
             asyncio.create_task(collector.periodic_backfill(), name="backfill"),
             asyncio.create_task(collector.history_worker(), name="history-backfill"),
+            asyncio.create_task(immediate.run(), name="immediate-send"),
         ]
         logger.info("服务已启动")
         await asyncio.gather(*tasks)

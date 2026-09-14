@@ -267,41 +267,71 @@ class AlbumPublisher:
         self._send_lock = asyncio.Lock()
 
     async def publish_for_slot(self, slot: Any, occurrence_utc: datetime) -> None:
-        delivery = self.db.claim_next_delivery(int(slot["route_id"]), occurrence_utc)
-        if not delivery:
-            logger.info("发布时间队列为空 target=%s time=%s", slot["target_telegram_id"], occurrence_utc.isoformat())
-            return
-        await self.publish(delivery)
-
-    async def publish(self, delivery: Any) -> None:
         async with self._send_lock:
-            await self._respect_target_interval(delivery["last_sent_at"])
-            try:
-                messages = await self._load_complete_album(delivery)
-                await self._ensure_topic_available(delivery)
-                sent = await self._send_with_flood_wait(delivery, messages)
-                if not isinstance(sent, (list, tuple)):
-                    sent = [sent]
-                self.db.mark_delivery(
-                    int(delivery["id"]),
-                    "sent",
-                    target_message_ids=[int(message.id) for message in sent if message],
+            delivery = self.db.claim_next_delivery(int(slot["route_id"]), occurrence_utc)
+            if not delivery:
+                logger.info("发布时间队列为空 target=%s time=%s", slot["target_telegram_id"], occurrence_utc.isoformat())
+                return
+            await self._publish_claimed(delivery)
+
+    async def publish(self, delivery: Any) -> str:
+        async with self._send_lock:
+            return await self._publish_claimed(delivery)
+
+    async def publish_immediate_job(self, job_id: int) -> Any | None:
+        """Run one persistent batch without allowing scheduled sends to interleave."""
+        async with self._send_lock:
+            while True:
+                job = self.db.next_runnable_immediate_job()
+                if not job or int(job["id"]) != job_id:
+                    return None
+                if job["status"] == "cancel_requested":
+                    self.db.cancel_immediate_job(job_id)
+                    return self.db.finish_immediate_job(job_id)
+                delivery = self.db.claim_next_immediate_delivery(job_id)
+                if not delivery:
+                    return self.db.finish_immediate_job(job_id)
+                outcome = await self._publish_claimed(delivery)
+                self.db.mark_immediate_item_outcome(
+                    job_id, int(delivery["id"]), outcome
                 )
-                logger.info(
-                    "媒体组发布成功 delivery=%s target=%s topic=%s",
-                    delivery["id"],
-                    delivery["target_telegram_id"],
-                    delivery["target_topic_id"],
-                )
-            except SourceAlbumUnavailable as exc:
-                self.db.cancel_album(int(delivery["album_id"]), str(exc))
-                logger.warning("源媒体组不可用 delivery=%s: %s", delivery["id"], exc)
-            except asyncio.CancelledError:
-                # Leave it in sending; next startup will conservatively mark it ambiguous.
-                raise
-            except Exception as exc:
-                self.db.mark_delivery(int(delivery["id"]), "failed", error=str(exc)[:1000])
-                logger.exception("媒体组发布失败 delivery=%s", delivery["id"])
+                refreshed = self.db.next_runnable_immediate_job()
+                if refreshed and int(refreshed["id"]) == job_id and refreshed["status"] == "cancel_requested":
+                    self.db.cancel_immediate_job(job_id)
+                    return self.db.finish_immediate_job(job_id)
+
+    async def _publish_claimed(self, delivery: Any) -> str:
+        """Publish a delivery that has already atomically entered sending."""
+        await self._respect_target_interval(delivery["last_sent_at"])
+        try:
+            messages = await self._load_complete_album(delivery)
+            await self._ensure_topic_available(delivery)
+            sent = await self._send_with_flood_wait(delivery, messages)
+            if not isinstance(sent, (list, tuple)):
+                sent = [sent]
+            self.db.mark_delivery(
+                int(delivery["id"]),
+                "sent",
+                target_message_ids=[int(message.id) for message in sent if message],
+            )
+            logger.info(
+                "媒体组发布成功 delivery=%s target=%s topic=%s",
+                delivery["id"],
+                delivery["target_telegram_id"],
+                delivery["target_topic_id"],
+            )
+            return "sent"
+        except SourceAlbumUnavailable as exc:
+            self.db.cancel_album(int(delivery["album_id"]), str(exc))
+            logger.warning("源媒体组不可用 delivery=%s: %s", delivery["id"], exc)
+            return "cancelled"
+        except asyncio.CancelledError:
+            # Leave it in sending; next startup will conservatively mark it ambiguous.
+            raise
+        except Exception as exc:
+            self.db.mark_delivery(int(delivery["id"]), "failed", error=str(exc)[:1000])
+            logger.exception("媒体组发布失败 delivery=%s", delivery["id"])
+            return "failed"
 
     async def _respect_target_interval(self, last_sent_at: str | None) -> None:
         if not last_sent_at:

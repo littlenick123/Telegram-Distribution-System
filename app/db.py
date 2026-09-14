@@ -102,6 +102,39 @@ CREATE TABLE IF NOT EXISTS deliveries (
 CREATE INDEX IF NOT EXISTS idx_deliveries_queue
 ON deliveries(route_id, status, id);
 
+CREATE TABLE IF NOT EXISTS immediate_send_jobs (
+    id INTEGER PRIMARY KEY,
+    route_id INTEGER NOT NULL REFERENCES routes(id) ON DELETE CASCADE,
+    requester_id INTEGER NOT NULL,
+    requested_count INTEGER NOT NULL CHECK(requested_count > 0),
+    planned_count INTEGER NOT NULL CHECK(planned_count > 0),
+    status TEXT NOT NULL DEFAULT 'queued'
+        CHECK(status IN ('queued', 'running', 'cancel_requested', 'completed', 'cancelled')),
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    completed_at TEXT,
+    notified_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS immediate_send_items (
+    id INTEGER PRIMARY KEY,
+    job_id INTEGER NOT NULL REFERENCES immediate_send_jobs(id) ON DELETE CASCADE,
+    delivery_id INTEGER NOT NULL REFERENCES deliveries(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL CHECK(position > 0),
+    outcome TEXT NOT NULL DEFAULT 'reserved'
+        CHECK(outcome IN ('reserved', 'sending', 'sent', 'failed', 'cancelled', 'ambiguous', 'released')),
+    updated_at TEXT NOT NULL,
+    UNIQUE(job_id, delivery_id),
+    UNIQUE(job_id, position)
+);
+
+CREATE INDEX IF NOT EXISTS idx_immediate_jobs_queue
+ON immediate_send_jobs(status, id);
+
+CREATE INDEX IF NOT EXISTS idx_immediate_items_delivery
+ON immediate_send_items(delivery_id, outcome);
+
 CREATE TABLE IF NOT EXISTS alert_settings (
     route_id INTEGER PRIMARY KEY REFERENCES routes(id) ON DELETE CASCADE,
     threshold INTEGER NOT NULL DEFAULT 24 CHECK(threshold > 0),
@@ -115,7 +148,7 @@ CREATE TABLE IF NOT EXISTS service_settings (
 );
 """
 
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 
 
 class Database:
@@ -163,6 +196,9 @@ class Database:
                     version = 2
                 if version == 2:
                     self._migrate_v2_to_v3()
+                    version = 3
+                if version == 3:
+                    self._migrate_v3_to_v4()
             self.conn.execute(
                 "INSERT OR IGNORE INTO service_settings(key, value) VALUES ('timezone', 'Asia/Shanghai')"
             )
@@ -281,6 +317,14 @@ class Database:
                 """
             )
             conn.execute("UPDATE schema_version SET version = 3")
+
+    def _migrate_v3_to_v4(self) -> None:
+        # The v4 tables are created idempotently by SCHEMA before migrations run.
+        with self.transaction() as conn:
+            conn.execute("UPDATE schema_version SET version = 4")
+        violations = self.conn.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise RuntimeError(f"数据库迁移后外键检查失败: {violations}")
 
     def add_source(
         self,
@@ -1079,6 +1123,13 @@ class Database:
                   AND r.enabled = 1 AND s.enabled = 1
                   AND r.backfill_status = 'idle' AND s.forward_scan_status = 'idle'
                   AND a.source_date <= ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM immediate_send_items ii
+                      JOIN immediate_send_jobs ij ON ij.id = ii.job_id
+                      WHERE ii.delivery_id = d.id
+                        AND ii.outcome IN ('reserved', 'sending')
+                        AND ij.status IN ('queued', 'running', 'cancel_requested')
+                  )
                 ORDER BY a.source_date, a.id, d.id LIMIT 1
                 """,
                 (route_id, to_utc_iso(eligible_before)),
@@ -1106,6 +1157,372 @@ class Database:
                 """,
                 (row["id"],),
             ).fetchone()
+
+    def create_immediate_send_job(
+        self,
+        target_id: int,
+        target_topic_id: int,
+        requested_count: int,
+        requester_id: int,
+    ) -> dict[str, Any]:
+        """Reserve up to requested_count currently available FIFO deliveries."""
+        if requested_count <= 0:
+            raise ValueError("发送数量必须是大于 0 的整数")
+        if requested_count > 9_223_372_036_854_775_807:
+            raise ValueError("发送数量超出数据库整数范围")
+        now = to_utc_iso(utc_now())
+        with self.transaction() as conn:
+            route = conn.execute(
+                """
+                SELECT r.*, s.enabled AS source_enabled, s.forward_scan_status,
+                       s.title AS source_title, s.telegram_id AS source_telegram_id
+                FROM routes r JOIN sources s ON s.id = r.source_id
+                WHERE r.target_telegram_id = ? AND r.target_topic_id = ?
+                """,
+                (target_id, target_topic_id),
+            ).fetchone()
+            if not route:
+                raise ValueError("目标频道尚未映射")
+            if not route["enabled"]:
+                raise ValueError("目标映射已停用，请先启用后再立即发送")
+            if not route["source_enabled"]:
+                raise ValueError("源频道已停用，请先启用后再立即发送")
+            if route["backfill_status"] != "idle":
+                raise ValueError("目标历史回填尚未完成，暂不能立即发送")
+            if route["forward_scan_status"] != "idle":
+                raise ValueError("源频道正向补录尚未完成，暂不能立即发送")
+
+            available_before = int(conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM deliveries d
+                JOIN source_albums a ON a.id = d.album_id
+                WHERE d.route_id = ? AND d.status = 'pending' AND a.status = 'active'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM immediate_send_items ii
+                      JOIN immediate_send_jobs ij ON ij.id = ii.job_id
+                      WHERE ii.delivery_id = d.id
+                        AND ii.outcome IN ('reserved', 'sending')
+                        AND ij.status IN ('queued', 'running', 'cancel_requested')
+                  )
+                """,
+                (route["id"],),
+            ).fetchone()[0])
+            planned = min(requested_count, available_before)
+            if not planned:
+                return {
+                    "job_id": None,
+                    "requested_count": requested_count,
+                    "planned_count": 0,
+                    "available_count": 0,
+                }
+            cursor = conn.execute(
+                """
+                INSERT INTO immediate_send_jobs(
+                    route_id, requester_id, requested_count, planned_count, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (route["id"], requester_id, requested_count, planned, now),
+            )
+            job_id = int(cursor.lastrowid)
+            conn.execute(
+                """
+                INSERT INTO immediate_send_items(job_id, delivery_id, position, updated_at)
+                SELECT ?, selected.delivery_id, selected.position, ?
+                FROM (
+                    SELECT d.id AS delivery_id,
+                           ROW_NUMBER() OVER (ORDER BY a.source_date, a.id, d.id) AS position
+                    FROM deliveries d
+                    JOIN source_albums a ON a.id = d.album_id
+                    WHERE d.route_id = ? AND d.status = 'pending' AND a.status = 'active'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM immediate_send_items ii
+                          JOIN immediate_send_jobs ij ON ij.id = ii.job_id
+                          WHERE ii.delivery_id = d.id
+                            AND ii.outcome IN ('reserved', 'sending')
+                            AND ij.status IN ('queued', 'running', 'cancel_requested')
+                      )
+                    ORDER BY a.source_date, a.id, d.id
+                    LIMIT ?
+                ) AS selected
+                """,
+                (job_id, now, route["id"], planned),
+            )
+            return {
+                "job_id": job_id,
+                "requested_count": requested_count,
+                "planned_count": planned,
+                "available_count": available_before - planned,
+            }
+
+    def next_runnable_immediate_job(self) -> sqlite3.Row | None:
+        """Return the oldest cancellable or currently runnable persistent job."""
+        with self._lock:
+            return self.conn.execute(
+                """
+                SELECT j.*, r.target_telegram_id, r.target_topic_id,
+                       r.target_title, r.target_topic_title,
+                       r.enabled AS route_enabled, s.enabled AS source_enabled,
+                       r.backfill_status, s.forward_scan_status
+                FROM immediate_send_jobs j
+                JOIN routes r ON r.id = j.route_id
+                JOIN sources s ON s.id = r.source_id
+                WHERE j.status = 'cancel_requested'
+                   OR (
+                       j.status IN ('queued', 'running')
+                       AND r.enabled = 1 AND s.enabled = 1
+                       AND r.backfill_status = 'idle'
+                       AND s.forward_scan_status = 'idle'
+                   )
+                ORDER BY j.id LIMIT 1
+                """
+            ).fetchone()
+
+    def claim_next_immediate_delivery(self, job_id: int) -> sqlite3.Row | None:
+        now = to_utc_iso(utc_now())
+        with self.transaction() as conn:
+            job = conn.execute(
+                """
+                SELECT j.id FROM immediate_send_jobs j
+                JOIN routes r ON r.id = j.route_id
+                JOIN sources s ON s.id = r.source_id
+                WHERE j.id = ? AND j.status IN ('queued', 'running')
+                  AND r.enabled = 1 AND s.enabled = 1
+                  AND r.backfill_status = 'idle' AND s.forward_scan_status = 'idle'
+                """,
+                (job_id,),
+            ).fetchone()
+            if not job:
+                return None
+            self._reconcile_immediate_items(conn, job_id, now)
+            item = conn.execute(
+                """
+                SELECT ii.id AS item_id, ii.delivery_id
+                FROM immediate_send_items ii
+                JOIN deliveries d ON d.id = ii.delivery_id
+                JOIN source_albums a ON a.id = d.album_id
+                WHERE ii.job_id = ? AND ii.outcome = 'reserved'
+                  AND d.status = 'pending' AND a.status = 'active'
+                ORDER BY ii.position LIMIT 1
+                """,
+                (job_id,),
+            ).fetchone()
+            if not item:
+                return None
+            updated = conn.execute(
+                """
+                UPDATE deliveries
+                SET status = 'sending', attempt_count = attempt_count + 1, updated_at = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (now, item["delivery_id"]),
+            )
+            if not updated.rowcount:
+                return None
+            conn.execute(
+                "UPDATE immediate_send_items SET outcome = 'sending', updated_at = ? WHERE id = ?",
+                (now, item["item_id"]),
+            )
+            conn.execute(
+                """
+                UPDATE immediate_send_jobs
+                SET status = 'running', started_at = COALESCE(started_at, ?)
+                WHERE id = ? AND status = 'queued'
+                """,
+                (now, job_id),
+            )
+            return conn.execute(
+                """
+                SELECT d.*, a.grouped_id, a.message_ids_json, a.source_date,
+                       a.status AS album_status,
+                       s.telegram_id AS source_telegram_id, s.title AS source_title,
+                       r.target_telegram_id, r.target_topic_id,
+                       r.target_title, r.target_topic_title, r.last_sent_at,
+                       ii.id AS immediate_item_id, ii.job_id AS immediate_job_id
+                FROM deliveries d
+                JOIN source_albums a ON a.id = d.album_id
+                JOIN sources s ON s.id = a.source_id
+                JOIN routes r ON r.id = d.route_id
+                JOIN immediate_send_items ii ON ii.delivery_id = d.id
+                WHERE d.id = ? AND ii.job_id = ?
+                """,
+                (item["delivery_id"], job_id),
+            ).fetchone()
+
+    @staticmethod
+    def _reconcile_immediate_items(
+        conn: sqlite3.Connection, job_id: int, now: str
+    ) -> None:
+        conn.execute(
+            """
+            UPDATE immediate_send_items
+            SET outcome = (
+                    SELECT d.status FROM deliveries d
+                    WHERE d.id = immediate_send_items.delivery_id
+                ),
+                updated_at = ?
+            WHERE job_id = ? AND outcome IN ('reserved', 'sending')
+              AND (SELECT d.status FROM deliveries d
+                   WHERE d.id = immediate_send_items.delivery_id)
+                  IN ('sent', 'failed', 'cancelled', 'ambiguous')
+            """,
+            (now, job_id),
+        )
+
+    def mark_immediate_item_outcome(
+        self, job_id: int, delivery_id: int, outcome: str
+    ) -> None:
+        if outcome not in {"sent", "failed", "cancelled", "ambiguous"}:
+            raise ValueError("无效的立即发送结果")
+        now = to_utc_iso(utc_now())
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE immediate_send_items SET outcome = ?, updated_at = ?
+                WHERE job_id = ? AND delivery_id = ? AND outcome = 'sending'
+                """,
+                (outcome, now, job_id, delivery_id),
+            )
+
+    def finish_immediate_job(self, job_id: int) -> sqlite3.Row | None:
+        now = to_utc_iso(utc_now())
+        with self.transaction() as conn:
+            job = conn.execute(
+                "SELECT * FROM immediate_send_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if not job:
+                return None
+            self._reconcile_immediate_items(conn, job_id, now)
+            active = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) FROM immediate_send_items
+                    WHERE job_id = ? AND outcome IN ('reserved', 'sending')
+                    """,
+                    (job_id,),
+                ).fetchone()[0]
+            )
+            if active:
+                return None
+            status = "cancelled" if job["status"] == "cancel_requested" else "completed"
+            conn.execute(
+                """
+                UPDATE immediate_send_jobs SET status = ?, completed_at = ?
+                WHERE id = ? AND status IN ('queued', 'running', 'cancel_requested')
+                """,
+                (status, now, job_id),
+            )
+            return self._immediate_job_summary(conn, job_id)
+
+    def cancel_immediate_job(self, job_id: int) -> sqlite3.Row | None:
+        now = to_utc_iso(utc_now())
+        with self.transaction() as conn:
+            job = conn.execute(
+                "SELECT status FROM immediate_send_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if not job or job["status"] not in {"queued", "running", "cancel_requested"}:
+                return None
+            self._reconcile_immediate_items(conn, job_id, now)
+            conn.execute(
+                """
+                UPDATE immediate_send_items SET outcome = 'released', updated_at = ?
+                WHERE job_id = ? AND outcome = 'reserved'
+                """,
+                (now, job_id),
+            )
+            sending = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM immediate_send_items WHERE job_id = ? AND outcome = 'sending'",
+                    (job_id,),
+                ).fetchone()[0]
+            )
+            status = "cancel_requested" if sending else "cancelled"
+            conn.execute(
+                """
+                UPDATE immediate_send_jobs
+                SET status = ?, completed_at = CASE WHEN ? = 'cancelled' THEN ? ELSE completed_at END
+                WHERE id = ?
+                """,
+                (status, status, now, job_id),
+            )
+            return self._immediate_job_summary(conn, job_id)
+
+    def list_immediate_jobs(
+        self,
+        target_id: int | None = None,
+        target_topic_id: int = 0,
+        limit: int = 20,
+    ) -> list[sqlite3.Row]:
+        query = """
+            SELECT j.id FROM immediate_send_jobs j
+            JOIN routes r ON r.id = j.route_id
+        """
+        params: list[Any] = []
+        if target_id is not None:
+            query += " WHERE r.target_telegram_id = ? AND r.target_topic_id = ?"
+            params.extend((target_id, target_topic_id))
+        query += " ORDER BY CASE WHEN j.status IN ('queued','running','cancel_requested') THEN 0 ELSE 1 END, j.id DESC LIMIT ?"
+        params.append(limit)
+        with self._lock:
+            ids = [int(row["id"]) for row in self.conn.execute(query, tuple(params)).fetchall()]
+            return [self._immediate_job_summary(self.conn, job_id) for job_id in ids]
+
+    def next_unnotified_immediate_job(self) -> sqlite3.Row | None:
+        with self._lock:
+            row = self.conn.execute(
+                """
+                SELECT id FROM immediate_send_jobs
+                WHERE status IN ('completed', 'cancelled') AND notified_at IS NULL
+                ORDER BY id LIMIT 1
+                """
+            ).fetchone()
+            return self._immediate_job_summary(self.conn, int(row["id"])) if row else None
+
+    def immediate_active_count(self) -> int:
+        with self._lock:
+            return int(
+                self.conn.execute(
+                    """
+                    SELECT COUNT(*) FROM immediate_send_jobs
+                    WHERE status IN ('queued', 'running', 'cancel_requested')
+                    """
+                ).fetchone()[0]
+            )
+
+    def mark_immediate_job_notified(self, job_id: int) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE immediate_send_jobs SET notified_at = ? WHERE id = ?",
+                (to_utc_iso(utc_now()), job_id),
+            )
+
+    @staticmethod
+    def _immediate_job_summary(
+        conn: sqlite3.Connection, job_id: int
+    ) -> sqlite3.Row:
+        row = conn.execute(
+            """
+            SELECT j.*, r.target_telegram_id, r.target_topic_id,
+                   r.target_title, r.target_topic_title,
+                   SUM(CASE WHEN ii.outcome = 'reserved' THEN 1 ELSE 0 END) AS reserved_count,
+                   SUM(CASE WHEN ii.outcome = 'sending' THEN 1 ELSE 0 END) AS sending_count,
+                   SUM(CASE WHEN ii.outcome = 'sent' THEN 1 ELSE 0 END) AS sent_count,
+                   SUM(CASE WHEN ii.outcome = 'failed' THEN 1 ELSE 0 END) AS failed_count,
+                   SUM(CASE WHEN ii.outcome = 'cancelled' THEN 1 ELSE 0 END) AS cancelled_count,
+                   SUM(CASE WHEN ii.outcome = 'ambiguous' THEN 1 ELSE 0 END) AS ambiguous_count,
+                   SUM(CASE WHEN ii.outcome = 'released' THEN 1 ELSE 0 END) AS released_count
+            FROM immediate_send_jobs j
+            JOIN routes r ON r.id = j.route_id
+            LEFT JOIN immediate_send_items ii ON ii.job_id = j.id
+            WHERE j.id = ? GROUP BY j.id
+            """,
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("立即发送任务不存在")
+        return row
 
     def mark_delivery(
         self,
@@ -1179,6 +1596,15 @@ class Database:
                 """,
                 (now,),
             )
+            conn.execute(
+                """
+                UPDATE immediate_send_items
+                SET outcome = 'ambiguous', updated_at = ?
+                WHERE outcome = 'sending'
+                  AND delivery_id IN (SELECT id FROM deliveries WHERE status = 'ambiguous')
+                """,
+                (now,),
+            )
             return cursor.rowcount
 
     def inventory(
@@ -1192,7 +1618,21 @@ class Database:
                    s.enabled AS source_enabled, s.forward_scan_status,
                    s.telegram_id AS source_telegram_id, s.title AS source_title,
                    a.threshold, a.enabled AS alert_enabled, a.last_alert_date,
-                   SUM(CASE WHEN d.status = 'pending' AND sa.status = 'active' THEN 1 ELSE 0 END) AS pending_count,
+                   SUM(CASE WHEN d.status = 'pending' AND sa.status = 'active'
+                       AND NOT EXISTS (
+                           SELECT 1 FROM immediate_send_items ii
+                           JOIN immediate_send_jobs ij ON ij.id = ii.job_id
+                           WHERE ii.delivery_id = d.id
+                             AND ii.outcome IN ('reserved', 'sending')
+                             AND ij.status IN ('queued', 'running', 'cancel_requested')
+                       ) THEN 1 ELSE 0 END) AS pending_count,
+                   SUM(CASE WHEN EXISTS (
+                           SELECT 1 FROM immediate_send_items ii
+                           JOIN immediate_send_jobs ij ON ij.id = ii.job_id
+                           WHERE ii.delivery_id = d.id
+                             AND ii.outcome IN ('reserved', 'sending')
+                             AND ij.status IN ('queued', 'running', 'cancel_requested')
+                       ) THEN 1 ELSE 0 END) AS immediate_reserved_count,
                    (SELECT GROUP_CONCAT(sl.time_hhmm, ',') FROM schedule_slots sl
                     WHERE sl.route_id = r.id AND sl.enabled = 1) AS schedule_times
             FROM routes r

@@ -152,6 +152,101 @@ class DatabaseTests(unittest.TestCase):
         self.assertTrue(self.db.retry_delivery(claimed["id"]))
         self.assertEqual(self.db.delivery_counts(-2001), {"pending": 1})
 
+    def test_immediate_jobs_reserve_fifo_and_do_not_wait_for_future_stock(self) -> None:
+        first_album, _ = self.ingest(500, [101, 102], minute=0)
+        second_album, _ = self.ingest(501, [103, 104], minute=10)
+        third_album, _ = self.ingest(502, [105, 106], minute=20)
+        route = self.db.get_route_by_target(-2001)
+
+        first = self.db.create_immediate_send_job(-2001, 0, 2, 123)
+        second = self.db.create_immediate_send_job(-2001, 0, 999999999999, 123)
+
+        self.assertEqual((first["planned_count"], first["available_count"]), (2, 1))
+        self.assertEqual((second["planned_count"], second["available_count"]), (1, 0))
+        inventory = self.db.inventory(-2001)[0]
+        self.assertEqual((inventory["pending_count"], inventory["immediate_reserved_count"]), (0, 3))
+        self.assertIsNone(
+            self.db.claim_next_delivery(route["id"], datetime(2026, 7, 16, tzinfo=timezone.utc))
+        )
+
+        claimed = self.db.claim_next_immediate_delivery(first["job_id"])
+        self.assertEqual(claimed["album_id"], first_album)
+        self.db.mark_delivery(claimed["id"], "sent", target_message_ids=[900])
+        self.db.mark_immediate_item_outcome(first["job_id"], claimed["id"], "sent")
+        claimed = self.db.claim_next_immediate_delivery(first["job_id"])
+        self.assertEqual(claimed["album_id"], second_album)
+        self.db.mark_delivery(claimed["id"], "failed", error="test")
+        self.db.mark_immediate_item_outcome(first["job_id"], claimed["id"], "failed")
+        summary = self.db.finish_immediate_job(first["job_id"])
+        self.assertEqual((summary["sent_count"], summary["failed_count"]), (1, 1))
+
+        claimed = self.db.claim_next_immediate_delivery(second["job_id"])
+        self.assertEqual(claimed["album_id"], third_album)
+
+    def test_immediate_job_cancel_releases_reserved_deliveries(self) -> None:
+        self.ingest(500, [101, 102])
+        self.ingest(501, [103, 104], minute=10)
+        job = self.db.create_immediate_send_job(-2001, 0, 2, 123)
+
+        cancelled = self.db.cancel_immediate_job(job["job_id"])
+
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(cancelled["released_count"], 2)
+        inventory = self.db.inventory(-2001)[0]
+        self.assertEqual((inventory["pending_count"], inventory["immediate_reserved_count"]), (2, 0))
+
+    def test_cancelling_running_immediate_job_finishes_current_and_releases_rest(self) -> None:
+        self.ingest(500, [101, 102])
+        self.ingest(501, [103, 104], minute=10)
+        job = self.db.create_immediate_send_job(-2001, 0, 2, 123)
+        claimed = self.db.claim_next_immediate_delivery(job["job_id"])
+
+        cancelling = self.db.cancel_immediate_job(job["job_id"])
+        self.assertEqual(cancelling["status"], "cancel_requested")
+        self.assertEqual(cancelling["released_count"], 1)
+        self.db.mark_delivery(claimed["id"], "sent", target_message_ids=[900])
+        self.db.mark_immediate_item_outcome(job["job_id"], claimed["id"], "sent")
+        summary = self.db.finish_immediate_job(job["job_id"])
+
+        self.assertEqual(summary["status"], "cancelled")
+        self.assertEqual((summary["sent_count"], summary["released_count"]), (1, 1))
+        self.assertEqual(self.db.inventory(-2001)[0]["pending_count"], 1)
+
+    def test_immediate_job_recovery_marks_current_item_ambiguous_and_continues(self) -> None:
+        self.ingest(500, [101, 102])
+        self.ingest(501, [103, 104], minute=10)
+        job = self.db.create_immediate_send_job(-2001, 0, 2, 123)
+        claimed = self.db.claim_next_immediate_delivery(job["job_id"])
+
+        self.assertEqual(self.db.recover_interrupted(), 1)
+        next_delivery = self.db.claim_next_immediate_delivery(job["job_id"])
+        self.assertNotEqual(next_delivery["id"], claimed["id"])
+        self.db.mark_delivery(next_delivery["id"], "sent", target_message_ids=[901])
+        self.db.mark_immediate_item_outcome(job["job_id"], next_delivery["id"], "sent")
+        summary = self.db.finish_immediate_job(job["job_id"])
+        self.assertEqual((summary["ambiguous_count"], summary["sent_count"]), (1, 1))
+
+    def test_immediate_job_rejects_disabled_or_scanning_route(self) -> None:
+        self.ingest(500, [101, 102])
+        self.db.set_route_enabled(-2001, False)
+        with self.assertRaisesRegex(ValueError, "目标映射已停用"):
+            self.db.create_immediate_send_job(-2001, 0, 1, 123)
+        self.db.set_route_enabled(-2001, True)
+        with self.db.transaction() as conn:
+            conn.execute("UPDATE routes SET backfill_status = 'pending' WHERE target_telegram_id = -2001")
+        with self.assertRaisesRegex(ValueError, "历史回填"):
+            self.db.create_immediate_send_job(-2001, 0, 1, 123)
+        with self.db.transaction() as conn:
+            conn.execute("UPDATE routes SET backfill_status = 'idle' WHERE target_telegram_id = -2001")
+        self.db.set_source_enabled(-1001, False)
+        with self.assertRaisesRegex(ValueError, "源频道已停用"):
+            self.db.create_immediate_send_job(-2001, 0, 1, 123)
+        self.db.set_source_enabled(-1001, True)
+        with self.db.transaction() as conn:
+            conn.execute("UPDATE sources SET forward_scan_status = 'scanning' WHERE telegram_id = -1001")
+        with self.assertRaisesRegex(ValueError, "正向补录"):
+            self.db.create_immediate_send_job(-2001, 0, 1, 123)
+
     def test_inventory_threshold_is_per_target(self) -> None:
         self.ingest(500, [101, 102])
         self.assertTrue(self.db.set_threshold(-2001, 1))
@@ -340,7 +435,7 @@ class DatabaseMigrationTests(unittest.TestCase):
                 self.assertEqual(db.list_schedules(target_id=-2001)[0]["id"], 13)
                 self.assertEqual(db.inventory(-2001)[0]["threshold"], 30)
                 self.assertEqual(route["delivery_start_message_id"], 100)
-                self.assertEqual(db.conn.execute("SELECT version FROM schema_version").fetchone()[0], 3)
+                self.assertEqual(db.conn.execute("SELECT version FROM schema_version").fetchone()[0], 4)
                 self.assertEqual(db.conn.execute("PRAGMA foreign_key_check").fetchall(), [])
             finally:
                 db.close()
@@ -391,6 +486,32 @@ class DatabaseMigrationTests(unittest.TestCase):
                 album = db.conn.execute("SELECT * FROM source_albums WHERE id = 3").fetchone()
                 self.assertEqual(route["delivery_start_message_id"], 501)
                 self.assertEqual((album["first_message_id"], album["last_message_id"]), (418, 420))
-                self.assertEqual(db.conn.execute("SELECT version FROM schema_version").fetchone()[0], 3)
+                self.assertEqual(db.conn.execute("SELECT version FROM schema_version").fetchone()[0], 4)
             finally:
                 db.close()
+
+    def test_v3_database_adds_immediate_send_tables(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = Path(tempdir) / "v3.sqlite3"
+            db = Database(path)
+            db.initialize()
+            db.conn.execute("UPDATE schema_version SET version = 3")
+            db.conn.execute("DROP TABLE immediate_send_items")
+            db.conn.execute("DROP TABLE immediate_send_jobs")
+            db.conn.commit()
+            db.close()
+
+            migrated = Database(path)
+            try:
+                migrated.initialize()
+                self.assertEqual(
+                    migrated.conn.execute("SELECT version FROM schema_version").fetchone()[0], 4
+                )
+                self.assertIsNotNone(
+                    migrated.conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name='immediate_send_jobs'"
+                    ).fetchone()
+                )
+                self.assertEqual(migrated.conn.execute("PRAGMA foreign_key_check").fetchall(), [])
+            finally:
+                migrated.close()

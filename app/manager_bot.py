@@ -57,6 +57,9 @@ BOT_COMMAND_SPECS = (
     BotCommandSpec("alert_time", "设置每日库存检查时间", 1, "/alert_time <HH:MM>", "/alert_time 09:00"),
     BotCommandSpec("alert_status", "查看全部目标告警状态", 0, "/alert_status", "/alert_status"),
     BotCommandSpec("queue", "查看全部或目标待发库存", 0, "/queue [目标标识]", "/queue -1009876543210:135"),
+    BotCommandSpec("send_now", "立即发送目标FIFO库存", 2, "/send_now <目标标识> <数量>", "/send_now -1009876543210:135 5"),
+    BotCommandSpec("send_now_status", "查看立即发送任务", 0, "/send_now_status [目标标识]", "/send_now_status -1009876543210:135"),
+    BotCommandSpec("send_now_cancel", "取消立即发送任务", 1, "/send_now_cancel <任务ID>", "/send_now_cancel 7"),
     BotCommandSpec("status", "查看服务和投递状态", 0, "/status", "/status"),
     BotCommandSpec("issues", "查看失败或状态不明投递", 0, "/issues [目标标识]", "/issues -1009876543210:135"),
     BotCommandSpec("retry", "重新入队失败或不明投递", 1, "/retry <投递ID>", "/retry 42"),
@@ -190,7 +193,21 @@ HELP_SECTIONS = (
 
 /queue [目标标识]
 查看全部或指定目标的可发布 pending 库存。
-示例：/queue -1009876543210:135""",
+示例：/queue -1009876543210:135
+
+/send_now <目标标识> <数量>
+立即按 FIFO 预留并发送目标当前库存；不依赖发布时间，每两组至少间隔 60 秒。
+示例：/send_now -1009876543210 5
+示例：/send_now -1009876543210:135 10
+⚠️ 库存不足时只安排现有组数，不等待未来库存；任务执行期间普通定时发布会等待。
+
+/send_now_status [目标标识]
+查看全部或指定目标的立即发送任务和结果统计。
+示例：/send_now_status -1009876543210:135
+
+/send_now_cancel <任务ID>
+取消任务并释放尚未发送的预留组；正在发送的一组不会被强制中断。
+示例：/send_now_cancel 7""",
     """🛠 状态与故障处理
 
 /status
@@ -229,12 +246,14 @@ class ManagerBot:
         db: Database,
         admin_ids: Iterable[int],
         history_wakeup: Callable[[], None] | None = None,
+        immediate_wakeup: Callable[[], None] | None = None,
     ):
         self.client = bot_client
         self.user_client = user_client
         self.db = db
         self.admin_ids = frozenset(int(value) for value in admin_ids)
         self.history_wakeup = history_wakeup
+        self.immediate_wakeup = immediate_wakeup
 
     def register_handlers(self) -> None:
         self.client.add_event_handler(
@@ -574,12 +593,71 @@ class ManagerBot:
                 target.topic_id if target else 0,
             )
             return self._format_inventory(rows, include_alert=False)
+        if command == "/send_now":
+            self._require(args, 2)
+            target = TargetRef.parse(args[0])
+            try:
+                count = int(args[1])
+            except ValueError as exc:
+                raise ValueError("发送数量必须是大于 0 的整数") from exc
+            result = self.db.create_immediate_send_job(
+                target.telegram_id,
+                target.topic_id,
+                count,
+                int(requester_id or 0),
+            )
+            if result["job_id"] is None:
+                return f"目标 {target} 当前没有可立即发送的 pending 库存，未创建任务。"
+            if self.immediate_wakeup:
+                self.immediate_wakeup()
+            shortage = ""
+            if result["planned_count"] < result["requested_count"]:
+                shortage = "（库存不足，仅安排当前已有库存）"
+            return (
+                f"立即发送任务已创建：#{result['job_id']}\n"
+                f"目标：{target}\n"
+                f"请求 {result['requested_count']} 组，实际安排 {result['planned_count']} 组{shortage}。\n"
+                f"安排后可用 pending={result['available_count']}；每两组至少间隔 60 秒。"
+            )
+        if command == "/send_now_status":
+            if len(args) > 1:
+                raise ValueError("格式: /send_now_status [目标标识]")
+            target = TargetRef.parse(args[0]) if args else None
+            rows = self.db.list_immediate_jobs(
+                target.telegram_id if target else None,
+                target.topic_id if target else 0,
+            )
+            return self._format_immediate_jobs(rows)
+        if command == "/send_now_cancel":
+            self._require(args, 1)
+            try:
+                job_id = int(args[0])
+            except ValueError as exc:
+                raise ValueError("任务 ID 必须是正整数") from exc
+            if job_id <= 0:
+                raise ValueError("任务 ID 必须是正整数")
+            result = self.db.cancel_immediate_job(job_id)
+            if not result:
+                return "未找到可取消的立即发送任务。"
+            if self.immediate_wakeup:
+                self.immediate_wakeup()
+            if result["status"] == "cancel_requested":
+                return (
+                    f"任务 #{job_id} 正在发送一组，已登记取消；"
+                    "本组结束后停止并释放其余库存。"
+                )
+            return (
+                f"立即发送任务 #{job_id} 已取消，"
+                f"释放 {result['released_count']} 组回普通 FIFO 队列。"
+            )
         if command == "/status":
             counts = self.db.status_counts()
             details = "，".join(f"{key}={value}" for key, value in sorted(counts.items())) or "暂无投递"
+            immediate = self.db.immediate_active_count()
             return (
                 f"服务状态\n源频道：{len(self.db.list_sources(enabled_only=True))} 个启用\n"
                 f"目标映射：{len(self.db.list_routes(enabled_only=True))} 个启用\n投递：{details}\n"
+                f"立即发送任务：{immediate} 个活动\n"
                 f"库存检查：每天 {self.db.get_setting('alert_time', '09:00')}"
             )
         if command == "/issues":
@@ -630,6 +708,12 @@ class ManagerBot:
             await self.client.send_message(admin_id, text)
         except Exception:
             logger.exception("历史扫描结果通知失败 admin=%s", admin_id)
+
+    async def send_immediate_notice(self, admin_id: int, text: str) -> None:
+        try:
+            await self.client.send_message(admin_id, text)
+        except Exception:
+            logger.exception("立即发送结果通知失败 admin=%s", admin_id)
 
     async def _verify_can_post(self, entity: Any) -> None:
         if getattr(entity, "creator", False):
@@ -682,7 +766,31 @@ class ManagerBot:
             if include_alert:
                 suffix = f"，阈值={row['threshold']}，告警={'开' if row['alert_enabled'] else '关'}"
             lines.append(
-                f"• {target_display(row)}: pending={row['pending_count']}{suffix}"
+                f"• {target_display(row)}: pending={row['pending_count']}，"
+                f"立即任务预留={row['immediate_reserved_count']}{suffix}"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_immediate_jobs(rows: list[Any]) -> str:
+        if not rows:
+            return "没有立即发送任务。"
+        labels = {
+            "queued": "排队中",
+            "running": "发送中",
+            "cancel_requested": "取消中",
+            "completed": "已完成",
+            "cancelled": "已取消",
+        }
+        lines = ["立即发送任务："]
+        for row in rows:
+            lines.append(
+                f"#{row['id']} {labels.get(row['status'], row['status'])} | {target_display(row)}\n"
+                f"  请求={row['requested_count']} 安排={row['planned_count']} "
+                f"待发={row['reserved_count']} 发送中={row['sending_count']} "
+                f"成功={row['sent_count']} 失败={row['failed_count']} "
+                f"源取消={row['cancelled_count']} 不明={row['ambiguous_count']} "
+                f"释放={row['released_count']}"
             )
         return "\n".join(lines)
 

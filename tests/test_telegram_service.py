@@ -141,6 +141,56 @@ class TelegramServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("reply_to", kwargs)
         self.assertEqual(self.db.delivery_counts(-2001), {"sent": 1})
 
+    async def test_publisher_runs_entire_immediate_job_in_fifo_order(self) -> None:
+        messages = [
+            message(11, 500, "第一组"),
+            message(12, 500),
+            message(13, 501, "第二组"),
+            message(14, 501),
+        ]
+        client = FakeTelegramClient(messages)
+        self.db.ingest_album(-1001, 500, [11, 12], messages[0].date)
+        self.db.ingest_album(-1001, 501, [13, 14], messages[2].date)
+        job = self.db.create_immediate_send_job(-2001, 0, 2, 123)
+        publisher = AlbumPublisher(client, self.db, min_target_interval=0)
+
+        result = await publisher.publish_immediate_job(job["job_id"])
+
+        self.assertEqual(len(client.send_calls), 2)
+        self.assertEqual(client.send_calls[0][1]["file"], ["media-11", "media-12"])
+        self.assertEqual(client.send_calls[1][1]["file"], ["media-13", "media-14"])
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["sent_count"], 2)
+        self.assertEqual(self.db.delivery_counts(-2001), {"sent": 2})
+
+    async def test_immediate_job_continues_after_one_delivery_fails(self) -> None:
+        class FailOnceClient(FakeTelegramClient):
+            def __init__(self, messages: list[object]) -> None:
+                super().__init__(messages)
+                self.failed_once = False
+
+            async def send_file(self, entity: int, **kwargs: object):
+                if not self.failed_once:
+                    self.failed_once = True
+                    raise RuntimeError("test send failure")
+                return await super().send_file(entity, **kwargs)
+
+        messages = [
+            message(11, 500), message(12, 500),
+            message(13, 501), message(14, 501),
+        ]
+        client = FailOnceClient(messages)
+        self.db.ingest_album(-1001, 500, [11, 12], messages[0].date)
+        self.db.ingest_album(-1001, 501, [13, 14], messages[2].date)
+        job = self.db.create_immediate_send_job(-2001, 0, 2, 123)
+
+        result = await AlbumPublisher(
+            client, self.db, min_target_interval=0
+        ).publish_immediate_job(job["job_id"])
+
+        self.assertEqual((result["failed_count"], result["sent_count"]), (1, 1))
+        self.assertEqual(self.db.delivery_counts(-2001), {"failed": 1, "sent": 1})
+
     async def test_publisher_sends_album_to_configured_forum_topic(self) -> None:
         self.db.add_route(-1001, -2001, "话题群", 135, "动作电影")
         messages = [message(11, 500, "第一项"), message(12, 500, "第二项")]

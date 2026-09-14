@@ -122,6 +122,51 @@ class ManagerBotTests(unittest.IsolatedAsyncioTestCase):
         response = await self.bot.dispatch("/schedule_del", [str(slot_id)])
         self.assertEqual(response, "发布时间已删除。")
 
+    async def test_send_now_creates_persistent_job_and_reports_shortage(self) -> None:
+        self.db.ingest_album(
+            -1001,
+            500,
+            [101, 102],
+            datetime(2026, 7, 15, tzinfo=timezone.utc),
+        )
+        wakeups: list[bool] = []
+        self.bot.immediate_wakeup = lambda: wakeups.append(True)
+
+        response = await self.bot.dispatch(
+            "/send_now", ["-2001", "999999999999"], requester_id=123
+        )
+
+        self.assertIn("实际安排 1 组", response)
+        self.assertIn("库存不足", response)
+        self.assertEqual(wakeups, [True])
+        status = await self.bot.dispatch("/send_now_status", ["-2001"])
+        self.assertIn("排队中", status)
+        self.assertIn("安排=1", status)
+        cancelled = await self.bot.dispatch("/send_now_cancel", ["1"])
+        self.assertIn("释放 1 组", cancelled)
+
+    async def test_send_now_supports_topic_target_and_empty_inventory(self) -> None:
+        self.db.add_route(-1001, -2001, "话题群", 135, "动作电影")
+        self.db.ingest_album(
+            -1001,
+            500,
+            [101, 102],
+            datetime(2026, 7, 15, tzinfo=timezone.utc),
+        )
+        response = await self.bot.dispatch(
+            "/send_now", ["-2001:135", "1"], requester_id=123
+        )
+        self.assertIn("-2001:135", response)
+        empty = await self.bot.dispatch(
+            "/send_now", ["-2001:135", "1"], requester_id=123
+        )
+        self.assertIn("没有可立即发送", empty)
+
+    async def test_send_now_validates_positive_count(self) -> None:
+        for value in ("0", "-1", "not-a-number"):
+            with self.assertRaisesRegex(ValueError, "大于 0"):
+                await self.bot.dispatch("/send_now", ["-2001", value], requester_id=123)
+
     async def test_route_backfill_command_is_idempotent(self) -> None:
         self.db.ingest_album(
             -1001,
